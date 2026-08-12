@@ -1,0 +1,65 @@
+# vLLM 0.27.1 + SM120 DeepGEMM + DSpark decode patches — BAKED.
+#
+# WHY THIS EXISTS
+# vllm027-gb10:sm120 fixed only the DeepGEMM arch-12 dispatch. Serving DSpark
+# additionally needs a source patch to vLLM's sparse_swa.py, which we ran for a
+# while as a :ro bind-mount. Bind-mounts are invisible to `docker run`, survive
+# nothing but the exact compose file that declares them, and silently vanish on
+# a --force-recreate from a different file. Bake them in instead.
+#
+# We apply the patch with the anchored patcher rather than COPYing whole files:
+# the anchors are exact strings from vLLM 0.27.1 / FlashInfer 0.6.16.post3, so
+# if the base image ever changes underneath us the BUILD FAILS instead of
+# silently shipping a stale copy of upstream's file.
+#
+# Patch 1 (functional, required):
+#   vllm/v1/attention/backends/mla/sparse_swa.py
+#   noncausal_index_width = cdiv(window + k, 128)*128 = cdiv(133,128)*128 = 256,
+#   but FlashInfer's SM120 decode-dsv4 kernel is only instantiated for
+#   topk in {128, 512, 1024}. No 256 kernel -> the dispatch gate falls through to
+#   the prefill-only orchestrator -> "Check failed: num_tokens > 64 (5 vs 64)".
+#   Round up to the next instantiated width (512). Padding slots are already -1
+#   and capped by swa_topk_lens, so it is semantics-preserving; measured <0.5 ms/step.
+#
+# Patch 2 (diagnostic only, never fires):
+#   flashinfer/mla/_sparse_mla_sm120.py
+#   Replaces the opaque C++ ICHECK with a Python error printing every dispatch-gate
+#   term. Kept because the next person to hit a gate mismatch should not have to
+#   rediscover which term was wrong.
+#
+# BUILD (on BOTH castor and pollux — no registry between them):
+#   cd ~/vllm027-build && docker build -f Dockerfile.vllm027-patched -t vllm027-gb10:patched .
+# Context must contain patch-dspark-sm120.py.
+
+FROM vllm027-gb10:sm120
+
+USER root
+
+ARG VLLM_SPARSE_SWA=/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py
+ARG FI_SPARSE_MLA=/usr/local/lib/python3.12/dist-packages/flashinfer/mla/_sparse_mla_sm120.py
+
+COPY patch-dspark-sm120.py /opt/patch-dspark-sm120.py
+
+RUN set -eux; \
+    python3 /opt/patch-dspark-sm120.py "${VLLM_SPARSE_SWA}" "${FI_SPARSE_MLA}"
+
+# Assert the patches actually landed. A build that ships unpatched DSpark attention
+# looks healthy right up until the first decode step, which is the worst time to
+# find out.
+RUN set -eux; \
+    grep -q 'PATCH(dspark-sm120)' "${VLLM_SPARSE_SWA}"       || { echo "FATAL: sparse_swa.py not patched"; exit 1; }; \
+    grep -q 'PATCH(gate-diagnostic)' "${FI_SPARSE_MLA}"      || { echo "FATAL: _sparse_mla_sm120.py not patched"; exit 1; }; \
+    grep -q '128, 512, 1024' "${VLLM_SPARSE_SWA}"            || { echo "FATAL: instantiated-topk list missing"; exit 1; }; \
+    python3 -c "import ast,sys; [ast.parse(open(p).read()) for p in sys.argv[1:]]" \
+        "${VLLM_SPARSE_SWA}" "${FI_SPARSE_MLA}"; \
+    echo "OK: both patches present and syntactically valid"
+
+# Re-assert the two properties the base image guarantees, so a rebuilt/retagged
+# base cannot regress them unnoticed.
+RUN set -eux; \
+    python3 -c "import torch; print('torch', torch.__version__); assert torch.__version__.startswith('2.13'), 'torch downgraded — flashinfer pip install without --no-deps?'"; \
+    P="$(python3 -c 'import deep_gemm,os;print(os.path.dirname(deep_gemm.__file__))')"; \
+    SO="$(ls ${P}/_C*.so | head -1)"; \
+    { strings "${SO}" | grep -q 'sm120'; } || grep -rqs 'sm120' "${P}/include" \
+        || { echo "FATAL: base image lost SM120 DeepGEMM"; exit 1; }; \
+    echo "OK: torch intact, SM120 DeepGEMM present"

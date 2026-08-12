@@ -1,0 +1,69 @@
+# vLLM 0.27.1 for DGX Spark / GB10 (SM121a)
+#
+# WHY THIS EXISTS
+# The official vllm/vllm-openai:v0.27.1 arm64 image ships DeepGEMM compiled for
+# SM100a ONLY (verified: `strings _C.cpython-312-aarch64-linux-gnu.so` yields the
+# single arch token "100a"). vLLM's platform gate, however, reports DeepGEMM as
+# supported on capability *family 120* (vllm/platforms/cuda.py:665-671), which
+# includes GB10 (cc 12.1). Result on a DGX Spark:
+#
+#   RuntimeError: Assertion error (deepgemm-src/csrc/apis/hyperconnection.hpp:56):
+#   Unsupported architecture
+#
+# ...and it is NOT avoidable via VLLM_USE_DEEP_GEMM=0 / VLLM_MOE_USE_DEEP_GEMM=0;
+# the DeepSeek-V4 path calls into DeepGEMM regardless.
+#
+# DeepGEMM itself already supports the arch — cmake/external_projects/deepgemm.cmake
+# lists "12.0a" "12.1a", and tools/install_deepgemm.sh pins a ref chosen precisely
+# "due to sm120 support". The published arm64 image simply intersected CUDA_ARCHS
+# down to datacenter Blackwell. So we only rebuild that one component.
+#
+# We install it as a top-level `deep_gemm` package: vllm/utils/deep_gemm.py imports
+# site-packages `deep_gemm` FIRST and only falls back to vllm.third_party.deep_gemm,
+# so this shadows the under-built vendored copy without patching the wheel.
+#
+# Reference (our working 0.21 stack) has arch tokens: 100a AND 120a.
+
+FROM vllm/vllm-openai:v0.27.1
+
+# 10.0a keeps parity with the stock build; 12.1a is what GB10 needs.
+ENV TORCH_CUDA_ARCH_LIST="10.0a 12.1a"
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+# Keep in sync with vLLM 0.27.1 cmake/external_projects/deepgemm.cmake
+ARG DEEPGEMM_REPO=https://github.com/vllm-project/DeepGEMM.git
+# nv_dev+situ+0810 — the ONLY branch with both SM120 kernels and the
+# hyperconnection/einsum APIs vLLM 0.27.1 calls. The ref vLLM pins
+# (e21c821f) has arch_major dispatch for 9 and 10 only.
+ARG DEEPGEMM_REF=9e8903799beb0b65d88e5ca08940dd5cd712c7d2
+ARG BUILD_JOBS=8
+
+USER root
+# The vllm-openai image ships the CUDA *runtime* + nvcc but not the dev headers.
+# Without these the DeepGEMM build dies on:  fatal error: cusparse.h: No such file
+# (torch here is cu130, so the 13-0 series is the matching one).
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        git cmake ninja-build cuda-libraries-dev-13-0 && \
+    rm -rf /var/lib/apt/lists/*; \
+    git clone --filter=blob:none "${DEEPGEMM_REPO}" /tmp/deepgemm; \
+    cd /tmp/deepgemm; \
+    git checkout "${DEEPGEMM_REF}"; \
+    git submodule update --init --recursive --depth 1 third-party/cutlass third-party/fmt; \
+    MAX_JOBS="${BUILD_JOBS}" CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}" \
+      python3 setup.py bdist_wheel; \
+    python3 -m pip install --no-cache-dir dist/*.whl; \
+    cd /; rm -rf /tmp/deepgemm
+
+# Fail the build unless the installed package actually carries SM120 support.
+# NOTE: DeepGEMM JITs its kernels, so _C.so is a host dispatcher — check for the
+# sm120 dispatch/impl sources, not SASS arch tokens.
+RUN set -eux; \
+    P="$(python3 -c 'import deep_gemm,os;print(os.path.dirname(deep_gemm.__file__))')"; \
+    echo "installed at: ${P}"; \
+    SO="$(ls ${P}/_C*.so | head -1)"; \
+    if strings "${SO}" | grep -q 'sm120'; then echo "OK: sm120 in _C.so"; \
+    elif grep -rqs 'sm120' "${P}/include"; then echo "OK: sm120 in JIT includes"; \
+    else echo "FATAL: no SM120 support in built DeepGEMM"; exit 1; fi; \
+    python3 -c "import deep_gemm; print('import OK, version', getattr(deep_gemm,'__version__','?'))"
