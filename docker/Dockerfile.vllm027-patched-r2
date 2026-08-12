@@ -1,0 +1,49 @@
+# vllm027-gb10:patched-r2 — :patched plus the DSML grammar-on-auto patch.
+#
+# WHY THIS TAG EXISTS
+# :patched serves production. On 2026-08-12 we reproduced the 08-11 tool-calling failure against
+# it at roughly 1% per tool call: the model emits invalid DSML (invented tags, stray closers) as
+# CONTENT instead of a structured tool call. vLLM 0.27 already ships the grammar that prevents
+# this; it is gated off for tool_choice="auto" unless a tool sets strict=true, which is exactly
+# what agents send and what LiteLLM strips. This image ungates it. See patch-dsml-grammar.py.
+#
+# Layered on :patched rather than rebuilt from :sm120 so the DSpark decode patches are provably
+# the same bytes as the image currently serving production — this build adds one file change and
+# nothing else.
+#
+# ROLLBACK IS THE TAG: :patched is untouched and remains the tested fallback. Never overwrite it.
+# Runtime kill switches (no rebuild): VLLM_DSML_GRAMMAR_ON_AUTO=0, or upstream's
+# VLLM_ENFORCE_STRICT_TOOL_CALLING=0.
+#
+# BUILD (on BOTH castor and pollux — there is no registry between them):
+#   cd ~/vllm027-build && docker build -f Dockerfile.vllm027-patched-r2 -t vllm027-gb10:patched-r2 .
+# Context must contain patch-dsml-grammar.py. CPU-side only: safe to build while :patched serves.
+
+FROM vllm027-gb10:patched
+
+USER root
+
+ARG REGISTRY=/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/structural_tag_registry.py
+
+COPY patch-dsml-grammar.py /opt/patch-dsml-grammar.py
+
+RUN set -eux; \
+    python3 /opt/patch-dsml-grammar.py "${REGISTRY}"
+
+# Assert the patch landed AND that the inherited DSpark patches survived. An image that ships
+# unpatched attention looks healthy until the first decode step.
+RUN set -eux; \
+    grep -q 'PATCH(dsml-grammar-on-auto)' "${REGISTRY}" || { echo "FATAL: grammar patch missing"; exit 1; }; \
+    grep -q 'VLLM_DSML_GRAMMAR_ON_AUTO' "${REGISTRY}"   || { echo "FATAL: kill switch missing"; exit 1; }; \
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "${REGISTRY}"; \
+    grep -q 'PATCH(dspark-sm120)' /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
+        || { echo "FATAL: inherited DSpark decode patch missing — wrong base image"; exit 1; }; \
+    echo "OK: grammar patch present, DSpark patches inherited, syntax valid"
+
+# The grammar is worthless if deepseek_v4 is not a registered structural-tag model, and the
+# import must still succeed after editing the module.
+RUN set -eux; \
+    python3 -c "\
+from vllm.tool_parsers.structural_tag_registry import SUPPORTED_STRUCTURAL_TAG_MODELS as S; \
+assert 'deepseek_v4' in S, 'deepseek_v4 not a supported structural-tag model'; \
+print('OK: deepseek_v4 structural tag available, module imports clean')"

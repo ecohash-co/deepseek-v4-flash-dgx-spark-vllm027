@@ -29,28 +29,38 @@ the ones that **produced wrong answers** and how we caught them.
 | **Model** | `deepseek-ai/DeepSeek-V4-Flash-0731`, TP=2 across both nodes |
 | **Spec decode** | DSpark, `num_speculative_tokens=5`, probabilistic draft sampling |
 | **Context** | 1,048,576 · verified correct at **377,594** prompt tokens |
-| **KV pool** | **1,368,558 tokens** @ 1M ctx, `--gpu-memory-utilization 0.80` (1,499,595 @ 512K / 0.88) |
+| **KV pool** | **2,418,690 tokens** @ 1M ctx, 2.31× concurrency (`--gpu-memory-utilization 0.88`) |
 | **Stability** | 0 asserts at the 12-concurrency saturation point; ~3.3× throughput scaling c=1→c=12 |
-| **Tool calling** | 20/20 on an agent-shaped gate; **49/49 tool calls** in a real agent session — [read the incident first](docs/08-the-tool-calling-incident.md) |
-| **Status** | **serving production agent traffic** as of 2026-08-12, after a rollback and redeploy |
+| **Tool calling** | grammar-enforced via [`patch-dsml-grammar.py`](patches/patch-dsml-grammar.py) — [read the incident first](docs/08-the-tool-calling-incident.md) |
+| **Status** | **serving production agent traffic** as of 2026-08-12 on `vllm027-gb10:patched-r2` |
 
 **What we gained:** upstream base image (no unreproducible vendor overlay), **15% faster prefill
 at 512K**, and DeepSeek-V4 improvements that only exist in 0.27.x.
 
-**What we lost, honestly:** **~33% of the KV token pool** (2.03M → 1.37M tokens at 1M context),
-because upstream has no `nvfp4_ds_mla` KV dtype, and **decode kernel autotuning for DSpark decode
-shapes**, which upstream does not generate. Both are quantified in
-[docs/02-before-after.md](docs/02-before-after.md) and both are fixable — see
+**Correction — we did NOT lose the KV pool.** Earlier versions of this README reported a 38% KV
+loss (2.03M → 1.27M tokens) and blamed the absence of upstream's `nvfp4_ds_mla` dtype. **That was
+mostly an under-tuned `--gpu-memory-utilization`, not a dtype limitation.** At 0.88 the same
+upstream stack yields **2,418,690 tokens at 1M context — 18% MORE than the vendor overlay's
+2,049,509**, with concurrency 1.95× → 2.31×. `fp8_ds_mla` carries the same 584 B/token/layer
+layout; we simply had not raised the utilization. If you copied our old numbers as an argument
+against upstream, they were wrong.
+
+**What we did lose:** **decode kernel autotuning for DSpark decode shapes**, which upstream does
+not generate — quantified in [docs/02-before-after.md](docs/02-before-after.md), fixable, see
 [docs/07-roadmap.md](docs/07-roadmap.md).
 
 > ### ⚠️ Read this before you copy our config
 >
-> **1. Test tool calling at your agent's sampling parameters.** This stack passed every benchmark
-> we had and still broke our production agent within minutes. vLLM samples DSML *structural*
-> tokens at the request temperature, so a stack that is perfect at greedy defaults can emit
-> invented tool-call syntax at `temperature=1.0`. Our old smoke test — no temperature, no
-> streaming, one toy tool — passed 5/5 throughout the outage. Full postmortem, and the gate that
-> would have caught it: **[docs/08-the-tool-calling-incident.md](docs/08-the-tool-calling-incident.md)**.
+> **1. Apply the grammar patch, and test tool calling at your agent's sampling parameters.** This
+> stack passed every benchmark we had and still broke our production agent within minutes. vLLM
+> samples DSML *structural* tokens at the request temperature, so a stack that is perfect at greedy
+> defaults emits invalid tool-call syntax at `temperature=1.0` — we measured **~1% of tool calls**,
+> which is invisible to benchmarks and fatal to agents. 0.27 already ships a grammar that prevents
+> it but gates it off for `tool_choice="auto"`;
+> [`patches/patch-dsml-grammar.py`](patches/patch-dsml-grammar.py) ungates it (env kill switch, no
+> rebuild to revert). Our old smoke test — no temperature, no streaming, one toy tool — passed 5/5
+> throughout the outage. Full postmortem:
+> **[docs/08-the-tool-calling-incident.md](docs/08-the-tool-calling-incident.md)**.
 > Harness: [`harness/toolcall_tars.py`](harness/toolcall_tars.py).
 >
 > **2. Pin `--revision`.** We found our own production service running unpinned, resolving

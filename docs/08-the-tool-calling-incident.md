@@ -2,12 +2,22 @@
 
 **TL;DR** — 0.27.1 passed needle recall at 377,594 tokens, arithmetic, JSON mode, 12-way
 concurrency saturation and zero asserts, then broke our agent so badly it was unusable inside
-minutes. We rolled back. A day later we redeployed **the same image on the same config** and
-**could not reproduce it**. The most useful artifact from the whole episode is not a patch — it is
-a gate that would have caught it, and the discovery that our old gate could not have.
+minutes. We rolled back, redeployed, and eventually **reproduced it: roughly 1% of tool calls emit
+invalid DSML as content instead of a structured call.** That rate is invisible to benchmarks and
+brutal for agents — at 1%/call, a 50-call session has a ~40% chance of at least one malformed call.
+
+**It is fixed structurally.** vLLM 0.27 already ships a DSML grammar that makes invalid markup
+unsamplable; it is gated off for exactly the case agents use. One anchored patch ungates it:
+[`patches/patch-dsml-grammar.py`](../patches/patch-dsml-grammar.py).
 
 If you take one thing from this page: **test tool calling at the sampling parameters your agent
 actually uses, not at the defaults your benchmark uses.**
+
+> **Revision history of this page**, because being wrong in public is part of the record: an earlier
+> version said the failure *did not reproduce*, based on a clean redeploy plus a 49-call agent
+> session. That was a sampling artifact — at ~1% per call, a 49-call session is clean about 60% of
+> the time. It reproduced on the next run. **"Not reproduced" is not "absent"**, and we said so too
+> confidently.
 
 ---
 
@@ -139,15 +149,77 @@ Two consequences worth internalizing:
 Add `--revision <sha>` to your serve command. We did not, and it cost us the ability to say
 whether our results and theirs are even about the same weights.
 
+## The reproduction
+
+Sampling across one afternoon, `temperature=1.0`, `top_p=0.95`, streaming, 5-tool set:
+
+| Stack | Samples | DSML leaks |
+|---|---|---|
+| 0.21 vendor overlay (baseline) | 40 | 0 |
+| **0.27.1, unpatched** | **~140** | **1** |
+| 0.27.1 + grammar patch | 80 | 0 |
+
+The one leak was a run of stray closing tags in `content`:
+
+```
+</｜DSML｜invoke> </｜DSML｜tool_calls>
+```
+
+Two things worth noting about how nearly we missed it:
+
+1. **It is a *closing* tag.** Our detector's first regex required `[<\[]` followed by the pipe, so
+   it did not match `</｜DSML｜…`. The `--self-test` caught that; nothing else would have. The run
+   that produced this leak would otherwise have been scored 20/20 clean.
+2. **The very next 40-sample run was clean.** A ~1% defect hides trivially in small samples. Do not
+   conclude "fixed" from one green run — we did exactly that earlier in this same investigation and
+   had to retract it.
+
+## The fix: ungate the grammar vLLM already has
+
+[`patches/patch-dsml-grammar.py`](../patches/patch-dsml-grammar.py) ·
+[`docker/Dockerfile.vllm027-patched-r2`](../docker/Dockerfile.vllm027-patched-r2)
+
+One anchored edit to `structural_tag_registry.get_model_structural_tag()`, gated behind an env var
+so upstream behavior is one restart away:
+
+```python
+if tool_choice == "auto" and not _any_tool_strict(tools):
+    import os as _os
+    if _os.environ.get("VLLM_DSML_GRAMMAR_ON_AUTO", "1") != "1":
+        return None
+```
+
+Kill switches, neither needing a rebuild: `VLLM_DSML_GRAMMAR_ON_AUTO=0` (this patch only) or
+`VLLM_ENFORCE_STRICT_TOOL_CALLING=0` (upstream, disables all structural tags).
+
+**Verify engagement structurally — do not infer it from a clean run.** xgrammar's matcher only
+exists when a grammar was compiled, so its log lines are a direct on/off signal:
+
+```
+unpatched  : 0 grammar_matcher messages during live traffic
+patched-r2 : 32
+```
+
+That is the actual proof the fix is doing something. The 80 clean samples are corroboration, not
+evidence — 80 samples cannot distinguish 1% from 0%.
+
+Expect one benign warning under speculative decoding:
+`matcher has terminated after accepting the stop token, but is trying to accept new token` —
+draft tokens arriving past the stop token, which the matcher correctly rejects.
+
 ## Honest status
 
-0.27.1 is serving our production agent traffic today and the failure has not recurred. But:
+0.27.1 + the grammar patch serves our production agent traffic. But be clear about what is and is
+not established:
 
-- **We never root-caused it.** Best current explanation is the known repetition-loop pathology
-  producing degenerate output that happened to land in tool-call syntax — not a version defect.
-- **We could not reproduce it on demand**, which also means we cannot demonstrate its absence.
-- The remaining unexcluded suspects are the upstream DSpark spec-decode reimplementation (none of
-  the vendor overlay's tuning knobs exist upstream) and numerics on the fp8/MXFP4 path.
+- **The root cause was never identified.** The grammar makes invalid *syntax* unsamplable; it does
+  not explain why the model wanted to emit it. Remaining suspects: the upstream DSpark spec-decode
+  reimplementation (none of the vendor overlay's tuning knobs exist upstream) and numerics on the
+  fp8/MXFP4 path.
+- **Grammar constrains syntax, not semantics.** If numerics are the underlying problem, you now get
+  well-formed tool calls with wrong arguments — and every gate on this page would pass them.
+- **We have one leak, not a distribution.** The 1% figure is a single event over ~140 samples. Treat
+  it as an order of magnitude, not a measurement.
 
 If you hit malformed DSML under agent traffic on 0.27.x, we would genuinely like to hear about it —
 open an issue. A second data point is worth more to both of us than another week of our own
