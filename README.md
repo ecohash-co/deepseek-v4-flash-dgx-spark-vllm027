@@ -31,8 +31,8 @@ the ones that **produced wrong answers** and how we caught them.
 | **Context** | 1,048,576 · verified correct at **377,594** prompt tokens |
 | **KV pool** | **2,418,690 tokens** @ 1M ctx, 2.31× concurrency (`--gpu-memory-utilization 0.88`) |
 | **Stability** | 0 asserts at the 12-concurrency saturation point; ~3.3× throughput scaling c=1→c=12 |
-| **Tool calling** | grammar-enforced via [`patch-dsml-grammar.py`](patches/patch-dsml-grammar.py) — [read the incident first](docs/08-the-tool-calling-incident.md) |
-| **Status** | **serving production agent traffic** as of 2026-08-12 on `vllm027-gb10:patched-r2` |
+| **Tool calling** | ~1% malformed-DSML rate, **unsolved on spec decode** — [read the incident first](docs/08-the-tool-calling-incident.md) |
+| **Status** | serving production agent traffic on `vllm027-gb10:patched-r2` with the grammar **disabled** (`VLLM_DSML_GRAMMAR_ON_AUTO=0`) |
 
 **What we gained:** upstream base image (no unreproducible vendor overlay), **15% faster prefill
 at 512K**, and DeepSeek-V4 improvements that only exist in 0.27.x.
@@ -51,17 +51,28 @@ not generate — quantified in [docs/02-before-after.md](docs/02-before-after.md
 
 > ### ⚠️ Read this before you copy our config
 >
-> **1. Apply the grammar patch, and test tool calling at your agent's sampling parameters.** This
-> stack passed every benchmark we had and still broke our production agent within minutes. vLLM
-> samples DSML *structural* tokens at the request temperature, so a stack that is perfect at greedy
-> defaults emits invalid tool-call syntax at `temperature=1.0` — we measured **~1% of tool calls**,
-> which is invisible to benchmarks and fatal to agents. 0.27 already ships a grammar that prevents
-> it but gates it off for `tool_choice="auto"`;
-> [`patches/patch-dsml-grammar.py`](patches/patch-dsml-grammar.py) ungates it (env kill switch, no
-> rebuild to revert). Our old smoke test — no temperature, no streaming, one toy tool — passed 5/5
-> throughout the outage. Full postmortem:
+> **1. ⛔ DO NOT enable the DSML grammar if you run DSpark speculative decoding.** We shipped that
+> advice here for about four hours and it was wrong. The grammar FSM rejects draft tokens past the
+> first position, collapsing speculative acceptance and — under sustained agent load — producing
+> repetition loops and CJK output in an English session. Measured on our stack:
+>
+> | | grammar off | grammar on |
+> |---|---|---|
+> | mean acceptance length | 4.67 | 1.75–2.14 |
+> | per-position acceptance | .910/.806/.716/.672/.567 | .914/.224/0/0/0 |
+> | avg draft acceptance | 73% | 15–22% |
+>
+> Note it looked *fine* at boot (71.6%) and only collapsed once real agent traffic arrived — a
+> short smoke test will not catch this. The patch remains in
+> [`patches/patch-dsml-grammar.py`](patches/patch-dsml-grammar.py) for anyone running **without**
+> spec decode, where it does fix the malformed-DSML problem, and it ships with an env kill switch
+> (`VLLM_DSML_GRAMMAR_ON_AUTO=0`) precisely because we needed it.
+>
+> **So the ~1% malformed-tool-call problem is currently UNSOLVED on a spec-decode stack.** Test
+> tool calling at your agent's real sampling parameters (temp 1.0, streaming, full toolset,
+> n≥20) — our old smoke test passed 5/5 throughout the original outage. Harness:
+> [`harness/toolcall_tars.py`](harness/toolcall_tars.py). Postmortem:
 > **[docs/08-the-tool-calling-incident.md](docs/08-the-tool-calling-incident.md)**.
-> Harness: [`harness/toolcall_tars.py`](harness/toolcall_tars.py).
 >
 > **2. Pin `--revision`.** We found our own production service running unpinned, resolving
 > `refs/main` to a *different* checkpoint than the one MiaAI-Lab tested

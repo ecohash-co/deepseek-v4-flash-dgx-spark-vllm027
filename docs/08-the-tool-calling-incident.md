@@ -6,9 +6,12 @@ minutes. We rolled back, redeployed, and eventually **reproduced it: roughly 1% 
 invalid DSML as content instead of a structured call.** That rate is invisible to benchmarks and
 brutal for agents — at 1%/call, a 50-call session has a ~40% chance of at least one malformed call.
 
-**It is fixed structurally.** vLLM 0.27 already ships a DSML grammar that makes invalid markup
-unsamplable; it is gated off for exactly the case agents use. One anchored patch ungates it:
-[`patches/patch-dsml-grammar.py`](../patches/patch-dsml-grammar.py).
+**The obvious fix does not work on a spec-decode stack.** vLLM 0.27 ships a DSML grammar that makes
+invalid markup unsamplable, gated off for exactly the case agents use, and one anchored patch
+ungates it — but enabling it **collapsed speculative-decode acceptance from 73% to ~20%** and
+produced repetition loops and CJK output under real agent load. We ran it in production for about
+four hours and reverted via its kill switch. **The ~1% malformed-tool-call problem is unsolved
+here.** Details in "The fix that wasn't" below.
 
 If you take one thing from this page: **test tool calling at the sampling parameters your agent
 actually uses, not at the defaults your benchmark uses.**
@@ -174,7 +177,36 @@ Two things worth noting about how nearly we missed it:
    conclude "fixed" from one green run — we did exactly that earlier in this same investigation and
    had to retract it.
 
-## The fix: ungate the grammar vLLM already has
+## The fix that wasn't: ungating the grammar breaks speculative decoding
+
+⚠️ **Read this before applying [`patches/patch-dsml-grammar.py`](../patches/patch-dsml-grammar.py).**
+It does what it claims — the grammar engages and malformed DSML becomes unsamplable — and on our
+stack that was not worth what it cost.
+
+Within ~40 minutes of enabling it, a coding agent began looping and emitting Chinese in an English
+session. Speculative-decode telemetry showed why:
+
+| | grammar off | grammar on |
+|---|---|---|
+| mean acceptance length | 4.67 | 1.75–2.14 |
+| per-position acceptance | .910/.806/.716/.672/.567 | **.914/.224/0/0/0** |
+| avg draft acceptance | 73% | 15–22% |
+
+Positions 3–5 accept **nothing**. The grammar FSM rejects draft tokens beyond the first, so
+speculation collapses to near-serial decode, and the constrained sampling degenerates under load.
+
+**The trap: it looked fine at boot.** Acceptance measured 71.6% on the first requests after
+restart and only collapsed once sustained agent traffic arrived. A smoke test — even a 40-sample
+gate — passes cleanly. We caught it because a human noticed an agent talking to itself in the
+wrong language, which is not a monitoring strategy.
+
+The patch ships with `VLLM_DSML_GRAMMAR_ON_AUTO=0` for exactly this reason, and we needed it the
+same day we wrote it. It remains useful if you run **without** speculative decoding.
+
+Upstream #44993 is supposed to make the grammar FSM correct across the reasoning boundary under
+async + spec, and it is present in our image. Empirically it is not sufficient here.
+
+### What the patch does (for the no-spec-decode case)
 
 [`patches/patch-dsml-grammar.py`](../patches/patch-dsml-grammar.py) ·
 [`docker/Dockerfile.vllm027-patched-r2`](../docker/Dockerfile.vllm027-patched-r2)
@@ -209,8 +241,15 @@ draft tokens arriving past the stop token, which the matcher correctly rejects.
 
 ## Honest status
 
-0.27.1 + the grammar patch serves our production agent traffic. But be clear about what is and is
-not established:
+0.27.1 serves our production agent traffic **with the grammar disabled** — i.e. with the ~1%
+malformed-tool-call rate still present and unmitigated. Be clear about what is and is not
+established:
+
+- **Two fixes attempted, neither viable.** Client-side `strict:true` is stripped by LiteLLM;
+  server-side grammar breaks speculative decoding. The remaining options are dropping spec decode
+  (roughly halves decode throughput) or a logits processor narrow enough not to fight the drafter.
+- **Detection is the current mitigation.** A cron greps agent transcripts for leaked DSML and
+  verifies the acceptance rate has not collapsed. That is monitoring, not a fix.
 
 - **The root cause was never identified.** The grammar makes invalid *syntax* unsamplable; it does
   not explain why the model wanted to emit it. Remaining suspects: the upstream DSpark spec-decode
