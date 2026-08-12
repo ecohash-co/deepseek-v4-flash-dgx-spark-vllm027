@@ -60,6 +60,11 @@ applies to our own hypotheses too.
 
 ## 3. Recover the KV pool: an NVFP4 MLA KV dtype upstream
 
+> **Do the free thing first.** Check whether you are leaving unified memory idle before treating
+> this as a kernel problem. We were: at `--gpu-memory-utilization 0.80`, ~12 GiB per node sat
+> unused, and moving to 0.88 nearly doubled KV (13,793 → 25,417 blocks). vLLM prints the headroom
+> at startup. Only the ~1.56× per-token footprint difference is inherent.
+
 Upstream's only DSV4 MLA KV dtype is `fp8_ds_mla` at **584 B/token/layer**. The overlay's
 `nvfp4_ds_mla` fit **~1.56× more tokens** in the same memory — measured, mechanism inferred.
 

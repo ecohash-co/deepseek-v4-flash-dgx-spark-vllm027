@@ -30,7 +30,23 @@ config (`k=5`, probabilistic draft sampling).
 | Boot to health | ~13 min | **~6 min** | ✅ |
 | Asserts @ 12 concurrency | — | **0** | ✅ |
 
-### The KV regression is the real cost of going upstream
+### ⚠️ Correction (2026-08-12): most of the "KV regression" below was OUR配置, not upstream
+
+**Read this before quoting the 38% figure.** Both stacks were run at
+`--gpu-memory-utilization 0.80` while ~12 GiB of unified memory sat idle on each node — vLLM was
+saying so in a startup line we had skimmed past (`... to fully utilize gpu memory. Current kv
+cache memory in use is 12.16 GiB`). Raising to **0.88** (profiling retained) took KV from
+12.16–13.47 GiB to **23.78 GiB**, i.e. `num_gpu_blocks` 13,793 → **25,417**.
+
+What survives: the **per-token footprint** penalty of `fp8_ds_mla` vs `nvfp4_ds_mla` (~7.3 vs
+~11.4 KB/token) is real and inherent. What does not: the absolute pool being 38% smaller. That was
+a configuration artifact, and the 0.21 stack would have gained from the same change.
+
+Also note `GPU KV cache size (tokens)` is computed as `max_concurrency × max_model_len`, so it
+**falls when you lower the context cap even as capacity rises**. Compare `max_concurrency` or
+`num_gpu_blocks` across configs, never the token figure.
+
+### The KV footprint difference (still real)
 
 At essentially the same GPU memory (−2.8%), the token pool fell 38%. That is a **~1.56× larger
 per-token KV footprint**, and it is almost certainly the KV dtype: upstream has no
