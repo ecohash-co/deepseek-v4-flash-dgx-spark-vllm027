@@ -30,7 +30,7 @@ config (`k=5`, probabilistic draft sampling).
 | Boot to health | ~13 min | **~6 min** | ✅ |
 | Asserts @ 12 concurrency | — | **0** | ✅ |
 
-### ⚠️ Correction (2026-08-12): most of the "KV regression" below was OUR配置, not upstream
+### ⚠️ Correction (2026-08-12): most of the "KV regression" below was OUR CONFIG, not upstream
 
 **Read this before quoting the 38% figure.** Both stacks were run at
 `--gpu-memory-utilization 0.80` while ~12 GiB of unified memory sat idle on each node — vLLM was
@@ -57,9 +57,11 @@ per-token KV footprint**, and it is almost certainly the KV dtype: upstream has 
 360 B — a ratio of ~1.62, which lines up with the measured 1.56. **We have not read the overlay's
 kernel, so treat the mechanism as a strong hypothesis and the measurement as fact.**
 
-Practical impact: at 1M context you get **1.21 concurrent requests instead of ~2**. If you serve
-long contexts to more than one caller at a time, this is the thing that will bite you, and it is
-the strongest argument for staying on the overlay until upstream lands an NVFP4 MLA KV dtype.
+Practical impact **per byte of KV**. It is not the same as the pool being small — see the
+correction above. After raising utilization to 0.88 and capping context at the measured demand
+(512K), this stack runs **2.91× concurrency at 512K on 25,417 blocks**, against 1.94–2.02× at 1M
+on the overlay. The footprint penalty costs you roughly a third of the tokens per byte; it does
+not, by itself, cost you the pool.
 
 ### Do not transplant the overlay's "B12X is 2× faster" advice
 
@@ -106,7 +108,13 @@ Concurrency 12 matters for a specific reason: at 12 sequences the speculative ve
 
 ## Verdict
 
-Going upstream is worth it **if** your workload is long-context and mostly serial, or you value
-a reproducible base image over peak concurrency. It is **not** yet worth it if you need 2×
-concurrent 1M-context streams — the KV regression is real and unfixed. See
-[07-roadmap.md](07-roadmap.md).
+Going upstream is worth it if you value a reproducible base image, want the DeepSeek-V4 work in
+0.27.x, and are willing to carry one ~15-line patch. The prefill win is real; the per-byte KV
+penalty is real; the pool gap we originally published was **our own configuration** and is
+recoverable.
+
+The honest caveat is capacity per byte: if you must serve several concurrent **1M-context**
+streams on 128 GB nodes, `nvfp4_ds_mla` on the overlay still fits ~1.56× more context per byte,
+and no amount of tuning changes that. Measure your own workload's actual context distribution
+first — ours turned out to peak at 291K against a 1M provision, which made the whole question
+moot. See [04-measurement.md](04-measurement.md) and [07-roadmap.md](07-roadmap.md).
