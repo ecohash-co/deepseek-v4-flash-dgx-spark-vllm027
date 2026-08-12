@@ -63,6 +63,11 @@ services:
         --host 0.0.0.0
         --port 8888
         --trust-remote-code
+        # STRONGLY RECOMMENDED -- pin the checkpoint. Without this vLLM resolves
+        # refs/main, which can silently change under a re-pull, and which may not be
+        # the revision any recipe you are comparing against was validated on.
+        # MiaAI-Lab's tested revision:
+        # --revision 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
         --tensor-parallel-size 2
         --pipeline-parallel-size 1
         --kv-cache-dtype fp8_ds_mla

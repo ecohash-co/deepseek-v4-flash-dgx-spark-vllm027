@@ -29,16 +29,39 @@ the ones that **produced wrong answers** and how we caught them.
 | **Model** | `deepseek-ai/DeepSeek-V4-Flash-0731`, TP=2 across both nodes |
 | **Spec decode** | DSpark, `num_speculative_tokens=5`, probabilistic draft sampling |
 | **Context** | 1,048,576 · verified correct at **377,594** prompt tokens |
+| **KV pool** | **1,368,558 tokens** @ 1M ctx, `--gpu-memory-utilization 0.80` (1,499,595 @ 512K / 0.88) |
 | **Stability** | 0 asserts at the 12-concurrency saturation point; ~3.3× throughput scaling c=1→c=12 |
+| **Tool calling** | 20/20 on an agent-shaped gate; **49/49 tool calls** in a real agent session — [read the incident first](docs/08-the-tool-calling-incident.md) |
+| **Status** | **serving production agent traffic** as of 2026-08-12, after a rollback and redeploy |
 
 **What we gained:** upstream base image (no unreproducible vendor overlay), **15% faster prefill
 at 512K**, and DeepSeek-V4 improvements that only exist in 0.27.x.
 
-**What we lost, honestly:** **38% of the KV token pool** (2.03M → 1.27M tokens at the same
-GPU memory), because upstream has no `nvfp4_ds_mla` KV dtype, and **decode kernel autotuning for
-DSpark decode shapes**, which upstream does not generate. Both are quantified in
+**What we lost, honestly:** **~33% of the KV token pool** (2.03M → 1.37M tokens at 1M context),
+because upstream has no `nvfp4_ds_mla` KV dtype, and **decode kernel autotuning for DSpark decode
+shapes**, which upstream does not generate. Both are quantified in
 [docs/02-before-after.md](docs/02-before-after.md) and both are fixable — see
 [docs/07-roadmap.md](docs/07-roadmap.md).
+
+> ### ⚠️ Read this before you copy our config
+>
+> **1. Test tool calling at your agent's sampling parameters.** This stack passed every benchmark
+> we had and still broke our production agent within minutes. vLLM samples DSML *structural*
+> tokens at the request temperature, so a stack that is perfect at greedy defaults can emit
+> invented tool-call syntax at `temperature=1.0`. Our old smoke test — no temperature, no
+> streaming, one toy tool — passed 5/5 throughout the outage. Full postmortem, and the gate that
+> would have caught it: **[docs/08-the-tool-calling-incident.md](docs/08-the-tool-calling-incident.md)**.
+> Harness: [`harness/toolcall_tars.py`](harness/toolcall_tars.py).
+>
+> **2. Pin `--revision`.** We found our own production service running unpinned, resolving
+> `refs/main` to a *different* checkpoint than the one MiaAI-Lab tested
+> (`9e165c30e2704aec5d9d593cce3eebd58bbef1cb`). Both snapshots sat in the cache and `main` chose.
+> A re-pull can swap weights under a running service, and cross-repo comparisons are meaningless
+> without it.
+>
+> **3. If you front vLLM with LiteLLM**, its `hosted_vllm` transform recursively strips `strict`
+> and `additionalProperties` from every tool, so 0.27's DSML grammar — gated behind
+> `tool_choice=="auto" and _any_tool_strict(tools)` — can never be enabled client-side.
 
 ---
 
@@ -139,6 +162,8 @@ anchors are exact strings from vLLM 0.27.1 / FlashInfer 0.6.16.post3, so a chang
 | [docs/05-dead-ends.md](docs/05-dead-ends.md) | What we tried that does not work, so you can skip it |
 | [docs/06-the-json-non-bug.md](docs/06-the-json-non-bug.md) | A "model bug" that turned out to be batch-size numerics |
 | [docs/07-roadmap.md](docs/07-roadmap.md) | Where the remaining performance is, ranked |
+| [docs/08-the-tool-calling-incident.md](docs/08-the-tool-calling-incident.md) | **How this stack passed every gate and still broke production** — and the gate that catches it |
+| [harness/toolcall_tars.py](harness/toolcall_tars.py) | Agent-shaped tool-calling gate: temp 1.0, streaming, real toolset, n≥20, with `--self-test` |
 | `docker/` | Both Dockerfiles + both compose files, as deployed |
 | `patches/` | The anchored, idempotent patcher |
 | `bench/` | Every harness, including the ones that produced wrong answers |
